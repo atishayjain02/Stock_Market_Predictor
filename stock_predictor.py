@@ -10,6 +10,7 @@ from sklearn.tree import DecisionTreeRegressor
 from sklearn.ensemble import RandomForestRegressor
 from sklearn.metrics import mean_squared_error
 import numpy as np
+import google.generativeai as genai
 
 # Page config and theming
 st.set_page_config(page_title="Stock Prediction App", page_icon="📈", layout="wide")
@@ -80,6 +81,15 @@ def load_data(ticker, start_dt, end_dt):
     data["BB_std"] = data["Close"].rolling(20).std()
     data["BB_upper"] = data["BB_mid"] + 2 * data["BB_std"]
     data["BB_lower"] = data["BB_mid"] - 2 * data["BB_std"]
+    # RSI (14) using Wilder's smoothing
+    delta = data["Close"].diff()
+    gain = delta.clip(lower=0)
+    loss = -delta.clip(upper=0)
+    window = 14
+    avg_gain = gain.ewm(alpha=1/window, adjust=False).mean()
+    avg_loss = loss.ewm(alpha=1/window, adjust=False).mean()
+    rs = avg_gain / (avg_loss.replace(0, np.nan))
+    data["RSI14"] = 100 - (100 / (1 + rs))
     return data
 
 with st.spinner("Loading data…"):
@@ -111,12 +121,12 @@ X = data_ml[feature_cols]
 y = data_ml['Close']
 
 # Layout tabs
-tab_overview, tab_data, tab_features, tab_model, tab_forecast = st.tabs(["Overview", "Data", "Features", "Modeling", "Forecast"])
+tab_overview, tab_data, tab_features, tab_model, tab_forecast , tab_chat = st.tabs(["Overview", "Data", "Features", "Modeling", "Forecast" ,"Chatbot"])
 
 with tab_overview:
     # Candlestick + Volume subplot
     fig = make_subplots(
-        rows=2, cols=1, shared_xaxes=True, vertical_spacing=0.03, row_heights=[0.75, 0.25]
+        rows=3, cols=1, shared_xaxes=True, vertical_spacing=0.03, row_heights=[0.65, 0.2, 0.15]
     )
 
     fig.add_trace(go.Candlestick(
@@ -152,13 +162,23 @@ with tab_overview:
         x=data['Date'], y=data['Volume'], marker_color=vol_colors, name='Volume', showlegend=False
     ), row=2, col=1)
 
+    # RSI subplot
+    fig.add_trace(go.Scatter(
+        x=data['Date'], y=data['RSI14'], mode='lines', name='RSI(14)', line=dict(width=1.5, color='#1ABC9C')
+    ), row=3, col=1)
+    # RSI guide lines
+    fig.add_hline(y=70, line_width=1, line_dash="dash", line_color="#E74C3C", row=3, col=1)
+    fig.add_hline(y=30, line_width=1, line_dash="dash", line_color="#2ECC71", row=3, col=1)
+
     fig.update_layout(
         template=PLOTLY_TEMPLATE,
         title=f"{selected_stock} Price (Candlestick) with MAs & Volume",
         xaxis=dict(rangeslider=dict(visible=False), showspikes=True),
         xaxis2=dict(showspikes=True),
+        xaxis3=dict(showspikes=True),
         yaxis_title="Price",
         yaxis2_title="Volume",
+        yaxis3_title="RSI",
         hovermode="x unified",
         margin=dict(l=10, r=10, t=50, b=10),
         legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1)
@@ -322,6 +342,158 @@ with tab_forecast:
         fig_fc.update_xaxes(rangebreaks=[dict(bounds=["sat", "mon"])])
         st.plotly_chart(fig_fc, use_container_width=True)
 
+with tab_chat:
+    # --------------------------- GEMINI AI CHATBOT ---------------------------
+    
+    import yfinance as yf
+    import streamlit as st
+    import re
+    import pandas as pd # Explicitly imported for clarity
+
+    # --- API Key Setup ---
+    # NOTE: It is HIGHLY recommended to use st.secrets or environment variables 
+    # for your API key, not hardcoding it.
+    GEMINI_API_KEY = "AIzaSyC2jh90m267UZEvJe3sXNMPQVHep7Qoe6g" 
+
+    try:
+        # ✅ Initialize Gemini Client
+        client = genai.Client(api_key=)
+    except Exception as e:
+        st.error(f"Failed to initialize Gemini Client: {e}")
+        # Use st.stop() if the client cannot be initialized
+        # st.stop() 
+
+
+    st.subheader("💬 Gemini AI Chatbot (Stock Market Assistant)")
+    st.markdown("Ask about stock prices (e.g., **AAPL**, **TSLA**) or general market trends.")
+
+    # Maintain chat history
+    if "messages" not in st.session_state:
+        st.session_state.messages = []
+
+    # Display previous messages
+    for msg in st.session_state.messages:
+        # Use st.chat_message for modern UI
+        with st.chat_message(msg["role"]):
+            st.markdown(msg["text"])
+
+    # User input logic (using st.chat_input for better UX)
+    if user_input := st.chat_input("Type your stock market question..."):
+
+        # 1. Store and display user message
+        st.session_state.messages.append({"role": "user", "text": user_input})
+        with st.chat_message("user"):
+            st.markdown(user_input)
+
+        # 2. Process and generate response
+        response_text = ""
+        user_lower = user_input.lower()
+        is_stock_query = False
+
+        # Start a spinner while processing
+        with st.spinner("Thinking..."):
+
+            # --- Ticker Extraction Logic ---
+            # 1. Look for explicit price/stock keywords
+            if "price" in user_lower or "stock" in user_lower:
+                is_stock_query = True
+            
+            # 2. Look for potential tickers (2-5 uppercase letters/numbers)
+            ticker_match = re.search(r'\b[A-Z0-9.]{2,10}\b', user_input) # Updated to include '.' for indices/NSE
+            
+            # Combine conditions: if it looks like a stock query OR we found a strong ticker match
+            if is_stock_query or ticker_match:
+                
+                # --- Define Ticker Symbol ---
+                ticker_symbol = None
+                
+                # A. Prioritize a direct ticker match
+                if ticker_match:
+                    ticker_symbol = ticker_match.group(0).upper()
+                
+                # B. Static map for common Indian names (as a secondary check)
+                company_map = {
+                    "INFOSYS": "INFY.NS", "RELIANCE": "RELIANCE.NS", "TCS": "TCS.NS",
+                    "HDFC": "HDFCBANK.NS", "ICICI": "ICICIBANK.NS", "WIPRO": "WIPRO.NS",
+                    "HCL": "HCLTECH.NS", "SBI": "SBIN.NS"
+                }
+                
+                # C. If a search term was found, check the map.
+                if ticker_symbol:
+                    # Check map for common names, otherwise use the found symbol
+                    ticker_symbol = company_map.get(ticker_symbol, ticker_symbol)
+                
+                # If we have a potential ticker, attempt yfinance lookup
+                if ticker_symbol:
+                    try:
+                        # --- Handle stock price queries via yfinance ---
+                        stock = yf.Ticker(ticker_symbol)
+                        hist = stock.history(period="1d")
+                        
+                        if not hist.empty:
+                            price = hist["Close"].iloc[-1]
+                            info = stock.info
+                            full_name = info.get('longName', ticker_symbol)
+                            currency = info.get('currency', '$')
+                            
+                            response_text = f"The latest closing price of **{full_name} ({ticker_symbol})** is **{currency}{price:,.2f}**."
+                            is_stock_query = True # Confirm successful data retrieval
+                        else:
+                            # Data returned empty, fall through to LLM
+                            response_text = f"I attempted to find price data for **{ticker_symbol}**, but the data source returned empty. I'll check my general knowledge instead."
+                            is_stock_query = False 
+                            
+                    except Exception:
+                        # yfinance failed (bad ticker, network issue), fall through to LLM
+                        response_text = f"I couldn't fetch real-time data for **{ticker_symbol}**. I'll check my general knowledge instead."
+                        is_stock_query = False
+                else:
+                    # Stock keywords were used, but no recognizable ticker was found
+                    is_stock_query = False
+
+
+            # --- Handle General Market Queries (or if yfinance failed) ---
+            if not response_text or not is_stock_query:
+                
+                # Prepare conversation history for Gemini
+                contents = []
+                for msg in st.session_state.messages:
+                    if msg["text"] != user_input: # Only include past messages for context
+                        gemini_role = "user" if msg["role"] == "user" else "model"
+                        contents.append({"role": gemini_role, "parts": [{"text": msg["text"]}]})
+
+                # Add the current user input as the final message
+                contents.append({"role": "user", "parts": [{"text": user_input}]})
+                
+                # Define system instruction (now supported by updated SDK)
+                system_instruction = (
+                    "You are an expert, helpful stock market assistant. "
+                    "Provide concise and informative answers. If the question is not about "
+                    "finance, stocks, or general knowledge, politely decline. "
+                    "Maintain context from previous messages."
+                )
+
+                # Call Gemini (with the system_instruction parameter)
+                try:
+                    gemini_response = client.models.generate_content(
+                        model="gemini-1.5-flash",
+                        contents=contents,
+                        system_instruction=system_instruction # This parameter requires the latest SDK
+                    )
+                    response_text = gemini_response.text
+                except Exception as e:
+                    response_text = f"⚠️ Gemini API Error: {str(e)}. Please check your API key and usage limits."
+
+
+        # 3. Store and display model response
+        st.session_state.messages.append({"role": "model", "text": response_text})
+        
+        with st.chat_message("model"):
+            st.markdown(response_text)
+            
+        # 4. Rerun the script to display the new chat history properly
+        st.rerun()
+
 # Sidebar mini close price chart
 mini = go.Figure()
 mini.add_trace(go.Scatter(x=data['Date'], y=data['Close'], name="Close", mode='lines', line=dict(color='#1ABC9C', width=1.5)))
@@ -335,4 +507,3 @@ mini.update_layout(
 with st.sidebar:
     st.subheader("Close Price")
     st.plotly_chart(mini, use_container_width=True)
-
